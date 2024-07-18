@@ -2,6 +2,7 @@ package cron
 
 import (
 	"context"
+	"github.com/niean/gotools/concurrent/semaphore"
 	"sort"
 	"sync"
 	"time"
@@ -43,6 +44,12 @@ type Schedule interface {
 	Next(time.Time) time.Time
 }
 
+// Concurent control
+type SemaOfCron struct {
+	Ctrl bool
+	Sema *semaphore.Semaphore
+}
+
 // EntryID identifies an entry within a Cron instance
 type EntryID int
 
@@ -69,6 +76,9 @@ type Entry struct {
 	// It is kept around so that user code that needs to get at the job later,
 	// e.g. via Entries() can do so.
 	Job Job
+
+	// Concurrent
+	Sema *SemaOfCron
 }
 
 // Valid returns true if this is not the zero entry.
@@ -164,6 +174,41 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 		Schedule:   schedule,
 		WrappedJob: c.chain.Then(cmd),
 		Job:        cmd,
+		Sema:       &SemaOfCron{Ctrl: false},
+	}
+	if !c.running {
+		c.entries = append(c.entries, entry)
+	} else {
+		c.add <- entry
+	}
+	return entry.ID
+}
+
+// AddFunc adds a func to the Cron to be run on the given schedule.
+func (c *Cron) AddFuncCC(spec string, cmd func(), cc int) (EntryID, error) {
+	return c.AddJobCC(spec, FuncJob(cmd), cc)
+}
+
+// AddFunc adds a Job to the Cron to be run on the given schedule.
+func (c *Cron) AddJobCC(spec string, cmd Job, cc int) (EntryID, error) {
+	schedule, err := c.parser.Parse(spec)
+	if err != nil {
+		return 0, err
+	}
+	return c.ScheduleCC(schedule, cmd, &SemaOfCron{Ctrl: true, Sema: semaphore.NewSemaphore(cc)}), nil
+}
+
+// Schedule with Concurrent Control
+func (c *Cron) ScheduleCC(schedule Schedule, cmd Job, sema *SemaOfCron) EntryID {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	c.nextID++
+	entry := &Entry{
+		ID:         c.nextID,
+		Schedule:   schedule,
+		WrappedJob: c.chain.Then(cmd),
+		Job:        cmd,
+		Sema:       sema,
 	}
 	if !c.running {
 		c.entries = append(c.entries, entry)
@@ -270,7 +315,17 @@ func (c *Cron) run() {
 					if e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
-					c.startJob(e.WrappedJob)
+					c.jobWaiter.Add(1)
+					go func(e *Entry) {
+						if e.Sema.Ctrl {
+							if !e.Sema.Sema.TryAcquire() {
+								return
+							}
+							defer e.Sema.Sema.Release()
+						}
+						c.jobWaiter.Done()
+						c.startJob(e.WrappedJob)
+					}(e)
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
@@ -306,11 +361,7 @@ func (c *Cron) run() {
 
 // startJob runs the given job in a new goroutine.
 func (c *Cron) startJob(j Job) {
-	c.jobWaiter.Add(1)
-	go func() {
-		defer c.jobWaiter.Done()
-		j.Run()
-	}()
+	j.Run()
 }
 
 // now returns current time in c location
